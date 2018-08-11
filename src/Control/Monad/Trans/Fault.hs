@@ -28,8 +28,10 @@ module Control.Monad.Trans.Fault
   , MonadFaults
   , faulty
   , FaultlessT (..)
-  , FaultyT ()
+  , runFaultlessT
+  , FaultyT (..)
   , runFaultyT
+  , askFaultController
   , FaultController ()
   , FaultConfig (..)
   , NewFault (..)
