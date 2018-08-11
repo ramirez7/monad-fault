@@ -54,6 +54,7 @@ import           Control.Monad.Trans.Control  (ComposeSt, MonadBaseControl (..),
                                                defaultLiftWith, defaultRestoreM,
                                                defaultRestoreT)
 import           Control.Monad.Trans.Identity (IdentityT (..))
+import           Control.Monad.Trans.Resource (MonadResource (..))
 import           Data.IORef
 import           Data.Kind                    (Constraint)
 import           GHC.TypeLits
@@ -180,6 +181,9 @@ instance MonadBase b m => MonadBase b (FaultlessT m) where
 instance MonadTrans FaultlessT where
   lift = FaultlessT . IdentityT
 
+instance MonadResource m => MonadResource (FaultlessT m) where
+  liftResourceT = lift . liftResourceT
+
 -- FaultyT Instances
 instance MonadBaseControl b m => MonadBaseControl b (FaultyT faults m) where
   type StM (FaultyT faults m) a = ComposeSt (FaultyT faults) m a
@@ -202,3 +206,6 @@ instance MonadTrans (FaultyT faults) where
 instance MonadReader r m => MonadReader r (FaultyT faults m) where
   ask = lift ask
   local f (FaultyT (ReaderT rf)) = FaultyT $ ReaderT $ \r -> local f (rf r)
+
+instance MonadResource m => MonadResource (FaultyT faults m) where
+  liftResourceT = lift . liftResourceT
