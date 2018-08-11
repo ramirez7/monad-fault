@@ -1,5 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes        #-}
 {-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GADTs                      #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -24,6 +25,7 @@
 -- (e.g. retry logic)
 module Control.Monad.Trans.Fault
   ( MonadFault (..)
+  , MonadFaults
   , faulty
   , FaultlessT (..)
   , FaultyT ()
@@ -35,17 +37,23 @@ module Control.Monad.Trans.Fault
   , showFaultController
   ) where
 
-import           Control.Exception           (SomeException, throwIO)
-import           Control.Monad.Base          (MonadBase (..))
-import           Control.Monad.IO.Class      (MonadIO (..))
-import           Control.Monad.Reader        (MonadReader (..), ReaderT (..))
-import           Control.Monad.Trans         (MonadTrans (..))
-import           Control.Monad.Trans.Control (ComposeSt, MonadBaseControl (..),
-                                              MonadTransControl (..),
-                                              defaultLiftBaseWith,
-                                              defaultLiftWith, defaultRestoreM,
-                                              defaultRestoreT)
+import           Control.Exception            (SomeException, throwIO)
+import           Control.Monad.Base           (MonadBase (..))
+import           Control.Monad.Catch          (MonadCatch, MonadThrow)
+import           Control.Monad.Except         (MonadError)
+import           Control.Monad.IO.Class       (MonadIO (..))
+import           Control.Monad.Logger         (MonadLogger (..))
+import           Control.Monad.Reader         (MonadReader (..), ReaderT (..))
+import           Control.Monad.State          (MonadState)
+import           Control.Monad.Trans          (MonadTrans (..))
+import           Control.Monad.Trans.Control  (ComposeSt, MonadBaseControl (..),
+                                               MonadTransControl (..),
+                                               defaultLiftBaseWith,
+                                               defaultLiftWith, defaultRestoreM,
+                                               defaultRestoreT)
+import           Control.Monad.Trans.Identity (IdentityT (..))
 import           Data.IORef
+import           Data.Kind                    (Constraint)
 import           GHC.TypeLits
 
 -- | Cause a fault named @fault@.
@@ -55,6 +63,10 @@ class Monad m => MonadFault (fault :: Symbol) m where
   -- >>> fault @"redis"
   fault :: m ()
 
+type family MonadFaults (faults :: [Symbol]) (m :: * -> *) :: Constraint where
+  MonadFaults '[] m = ()
+  MonadFaults (fault ': rest) m = (MonadFault fault m, MonadFaults rest m)
+
 -- | Automatic instances for MonadTrans
 instance {-# OVERLAPPABLE #-} (Monad (t m), MonadTrans t, MonadFault fault m) => MonadFault fault (t m) where
   fault = lift (fault @fault)
@@ -62,18 +74,24 @@ instance {-# OVERLAPPABLE #-} (Monad (t m), MonadTrans t, MonadFault fault m) =>
 -- | Tag an action as a potential fault named @fault@
 --
 -- @
--- do
---   redisResult <- faulty "redis" $ queryRedis
---   s3Result <- faulty "s3" $ queryS3
+-- f :: MonadFaults '["redis", "s3"] m => m ()
+-- f = do
+--   redisResult <- faulty @"redis" $ queryRedis
+--   s3Result <- faulty @"s3" $ queryS3
 --   doStuff redisResult s3Result
 -- @
 faulty :: forall fault m a. MonadFault fault m => m a -> m a
 faulty = (fault @fault *>)
 
 -- | Never fault. Equivalent to 'IdentityT'
-newtype FaultlessT m a = FaultlessT { runFaultlessT  :: m a }
+newtype FaultlessT m a = FaultlessT { unFaultlessT  :: IdentityT m a }
   deriving ( Functor, Applicative, Monad, MonadIO
+           , MonadLogger, MonadError e, MonadState s
+           , MonadReader r, MonadCatch, MonadThrow
            )
+
+runFaultlessT :: FaultlessT m a -> m a
+runFaultlessT = runIdentityT . unFaultlessT
 
 instance Monad m => MonadFault fault (FaultlessT m) where
   fault = pure ()
@@ -116,16 +134,21 @@ instance {-# OVERLAPPABLE #-} HasFault goal rest => HasFault goal (f ': rest) wh
 -- | Monad transformer with controller over the specified @faults@
 newtype FaultyT (faults :: [Symbol]) m a = FaultyT  { unFaultyT :: ReaderT (FaultController faults) m a }
   deriving ( Functor, Applicative, Monad, MonadIO
-           , MonadReader (FaultController faults))
+           , MonadLogger, MonadError e, MonadState s
+           , MonadCatch, MonadThrow
+           )
 
 runFaultyT :: FaultController faults -> FaultyT faults m a -> m a
 runFaultyT controller = flip runReaderT controller . unFaultyT
 
--- | If the FaultConfig in teh FaultController for the given @f@ is set, fault. Otherwise,
+askFaultController :: Monad m => FaultyT faults m (FaultController faults)
+askFaultController = FaultyT ask
+
+-- | If the FaultConfig in the FaultController for the given @f@ is set, fault. Otherwise,
 -- continue as normal
 instance forall f faults m. (MonadIO m, HasFault f faults) => MonadFault f (FaultyT faults m) where
   fault = do
-    fc <- ask
+    fc <- askFaultController
     FaultConfig mException <- liftIO $ getFault @f fc
     maybe (pure ()) (liftIO . throwIO) mException
 
@@ -138,30 +161,26 @@ showFaultController = \case
     restStr <- showFaultController rest
     pure $ "(FCNil " ++ show fc ++ " " ++ restStr ++ ")"
 
--- TODO: MonadBaseControl, MonadBase, other mtl stuff
-
--- | Instances
--- | FaultlessT
-
+-- FaultlessT Instances
 instance MonadBaseControl b m => MonadBaseControl b (FaultlessT m) where
   type StM (FaultlessT m) a = ComposeSt FaultlessT m a
   liftBaseWith = defaultLiftBaseWith
   restoreM     = defaultRestoreM
 
 instance MonadTransControl FaultlessT where
-  type StT FaultlessT a = a
-  liftWith f = FaultlessT $ f $ runFaultlessT
-  restoreT = FaultlessT
+  type StT FaultlessT a = StT IdentityT a
+  liftWith = defaultLiftWith FaultlessT unFaultlessT
+  restoreT = defaultRestoreT FaultlessT
 
 instance MonadBase b m => MonadBase b (FaultlessT m) where
   liftBase = FaultlessT . liftBase
 
 instance MonadTrans FaultlessT where
-  lift = FaultlessT
+  lift = FaultlessT . IdentityT
 
--- | FaultyT
+-- FaultyT Instances
 instance MonadBaseControl b m => MonadBaseControl b (FaultyT faults m) where
-  type StM (FaultyT faults m) a = ComposeSt FaultlessT m a
+  type StM (FaultyT faults m) a = ComposeSt (FaultyT faults) m a
   liftBaseWith = defaultLiftBaseWith
   restoreM     = defaultRestoreM
 
@@ -175,3 +194,9 @@ instance MonadBase b m => MonadBase b (FaultyT faults m) where
 
 instance MonadTrans (FaultyT faults) where
   lift = FaultyT . lift
+
+-- | Even though 'FaultyT' has a 'ReaderT' within, our 'MonadReader' instance
+-- is just a lift
+instance MonadReader r m => MonadReader r (FaultyT faults m) where
+  ask = lift ask
+  local f (FaultyT (ReaderT rf)) = FaultyT $ ReaderT $ \r -> local f (rf r)
