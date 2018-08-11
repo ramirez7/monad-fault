@@ -55,6 +55,10 @@ class Monad m => MonadFault (fault :: Symbol) m where
   -- >>> fault @"redis"
   fault :: m ()
 
+-- | Automatic instances for MonadTrans
+instance {-# OVERLAPPABLE #-} (Monad (t m), MonadTrans t, MonadFault fault m) => MonadFault fault (t m) where
+  fault = lift (fault @fault)
+
 -- | Tag an action as a potential fault named @fault@
 --
 -- @
