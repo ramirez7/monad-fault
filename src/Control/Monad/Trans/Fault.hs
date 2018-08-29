@@ -7,9 +7,11 @@
 {-# LANGUAGE KindSignatures             #-}
 {-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE PolyKinds                  #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
+{-# LANGUAGE TypeInType                 #-}
 {-# LANGUAGE TypeOperators              #-}
 {-# LANGUAGE UndecidableInstances       #-}
 
@@ -102,11 +104,12 @@ import           Control.Monad.Trans.Resource (MonadResource (..))
 import           Data.IORef
 import           Data.Kind                    (Constraint)
 import           Data.Proxy
-import           GHC.TypeLits
+import           Data.Kind                    (Type)
+import           Data.Typeable
 
 -- | @m@ is capable of having @fault@. @fault@s are
 -- named with type-level strings
-class Monad m => MonadFault (fault :: Symbol) m where
+class Monad m => MonadFault fault m where
   -- | Cause a fault named @fault@
   faultPrx :: Proxy fault -> m ()
 
@@ -115,23 +118,24 @@ class Monad m => MonadFault (fault :: Symbol) m where
 -- Meant to be used w/@TypeApplications@
 --
 -- >>> fault @"redis" :: MonadFault "redis" m => m ()
-fault :: forall (fault :: Symbol) m. MonadFault fault m => m ()
+fault :: forall fault m. MonadFault fault m => m ()
 fault = faultPrx (Proxy @fault)
 
 -- | One @m@ frequently has many potential @faults@
-type family MonadFaults (faults :: [Symbol]) (m :: * -> *) :: Constraint where
+type family MonadFaults (faults :: [k]) (m :: Type -> Type) :: Constraint where
   MonadFaults '[] m = ()
   MonadFaults (fault ': rest) m = (MonadFault fault m, MonadFaults rest m)
 
 -- | Automatic instances for MonadTrans
 instance {-# OVERLAPPABLE #-} (Monad (t m), MonadTrans t, MonadFault fault m) => MonadFault fault (t m) where
-  faultPrx _ = lift (fault @fault)
+--  faultPrx _ = lift (fault @fault)
+  faultPrx _ = lift (faultPrx (Proxy @fault))
 
 -- | Tag an action as a potential fault named @fault@
 --
 -- >>> faulty @"failure name" $ mightFail
 faulty :: forall fault m a. MonadFault fault m => m a -> m a
-faulty = (fault @fault *>)
+faulty = ((faultPrx (Proxy @fault)) *>)
 
 -- | Can never fault.
 newtype FaultlessT m a = FaultlessT { unFaultlessT  :: IdentityT m a }
@@ -152,9 +156,9 @@ data FaultConfig = FaultConfig (Maybe SomeException) deriving (Show)
 
 -- | Extensible record of FaultConfigs, each tagged with a fault name
 -- at the type level
-data FaultController (faults :: [Symbol]) where
+data FaultController (faults :: [k]) where
   FCNil :: FaultController '[]
-  FCCons :: forall f rest. KnownSymbol f => Proxy f -> !(IORef FaultConfig) -> FaultController rest -> FaultController (f ': rest)
+  FCCons :: forall f rest. Typeable f => Proxy f -> !(IORef FaultConfig) -> FaultController rest -> FaultController (f ': rest)
 
 -- | Create a default, non-faulting 'FaultController'
 class NewFault faults where
@@ -164,14 +168,14 @@ class NewFault faults where
 instance NewFault '[] where
   newFaultController = pure FCNil
 
-instance (KnownSymbol f, NewFault rest) => NewFault (f ': rest) where
+instance (Typeable f, NewFault rest) => NewFault (f ': rest) where
   newFaultController = do
     ioref <- newIORef (FaultConfig Nothing)
     rest <- newFaultController @rest
     pure $ FCCons Proxy ioref rest
 
 -- | Query & modify a 'FaultController' at certain faults
-class HasFault (f :: Symbol) faults where
+class HasFault f faults where
   getFaultConfig :: FaultController faults -> IO FaultConfig
   setFaultConfig :: FaultConfig -> FaultController faults -> IO ()
 
@@ -184,8 +188,8 @@ setFault :: forall fault faults e
 setFault e fc = setFaultConfig @fault (FaultConfig $ Just $ SomeException e) fc
 
 -- | Set a @fault@ to not fail.
-resetFault :: forall fault faults e
-          . (HasFault fault faults, Exception e)
+resetFault :: forall fault faults
+          . (HasFault fault faults)
          => FaultController faults
          -> IO ()
 resetFault fc = setFaultConfig @fault (FaultConfig Nothing) fc
@@ -199,7 +203,7 @@ instance {-# OVERLAPPABLE #-} HasFault goal rest => HasFault goal (f ': rest) wh
   setFaultConfig new (FCCons _ _ rest) = setFaultConfig @goal new rest
 
 -- | Monad transformer that allows the caller to control which faults occur
-newtype FaultyT (faults :: [Symbol]) m a = FaultyT  { unFaultyT :: ReaderT (FaultController faults) m a }
+newtype FaultyT (faults :: [k]) m a = FaultyT  { unFaultyT :: ReaderT (FaultController faults) m a }
   deriving ( Functor, Applicative, Monad, MonadIO
            , MonadLogger, MonadError e, MonadState s
            , MonadCatch, MonadThrow
@@ -229,7 +233,7 @@ showFaultController = \case
   FCCons prx ioref rest -> do
     fc <- readIORef ioref
     restStr <- showFaultController rest
-    pure $ "(FCCons @" ++ show (symbolVal prx) ++ " " ++ show fc ++ " " ++ restStr ++ ")"
+    pure $ "(FCCons @" ++ show (typeRep prx) ++ " " ++ show fc ++ " " ++ restStr ++ ")"
 
 -- | >>> fc <- newFaultController @'["x", "y"]
 -- >>> printFaultController fc
